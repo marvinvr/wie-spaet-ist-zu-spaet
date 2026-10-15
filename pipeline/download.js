@@ -13,7 +13,7 @@ import path from 'node:path';
 import { once } from 'node:events';
 import { Readable } from 'node:stream';
 
-import { GTFS_ZIP, ISTDATEN_DIR, ensureDir, log, mb } from './layout.js';
+import { GTFS_ZIP, ISTDATEN_DIR, ensureDir, log, mb, slots } from './layout.js';
 
 const GTFS_URL = 'https://gtfs.geops.ch/dl/gtfs_complete.zip';
 const ISTDATEN_URL =
@@ -25,6 +25,9 @@ const ISTDATEN_URL =
 const HEADERS_TIMEOUT = 30_000;
 const IDLE_TIMEOUT = 120_000;
 const REPORT_EVERY = 5000;
+// Monthly archives fetched at once. One connection tops out around 40 MB/s, so a
+// few in parallel fill the line; more would only split it further.
+const ISTDATEN_JOBS = 3;
 
 export function istdatenPath(year, month) {
 	return path.join(ISTDATEN_DIR, `ist-daten-v2-${year}-${String(month).padStart(2, '0')}.zip`);
@@ -157,19 +160,38 @@ export async function gtfs() {
  * @returns {Promise<string[]>} the archives now on disk
  */
 export async function istdaten(months) {
-	const paths = [];
+	const each = istdatenEach(months);
+	const fetched = await Promise.all(each.values());
+	return [...each.keys()].filter((_, index) => fetched[index]);
+}
+
+/**
+ * Starts downloading every month, ISTDATEN_JOBS at a time, without waiting.
+ *
+ * @returns {Map<string, Promise<boolean>>} per archive, whether it is on disk
+ *   once its download is through - so a reader can start on each as it lands
+ */
+export function istdatenEach(months) {
+	const limit = slots(ISTDATEN_JOBS);
+	const each = new Map();
 	for (const [year, month] of months) {
 		const dest = istdatenPath(year, month);
-		try {
-			await fetchTo(istdatenUrl(year, month), dest, path.basename(dest));
-		} catch (error) {
-			if (error.status === 404) {
-				log(`  ${path.basename(dest)}: not published yet (HTTP 404) - skipping`);
-				continue;
+		const done = limit.run(async () => {
+			try {
+				await fetchTo(istdatenUrl(year, month), dest, path.basename(dest));
+				return true;
+			} catch (error) {
+				if (error.status === 404) {
+					log(`  ${path.basename(dest)}: not published yet (HTTP 404) - skipping`);
+					return false;
+				}
+				throw error;
 			}
-			throw error;
-		}
-		paths.push(dest);
+		});
+		// Awaited by whoever reads the archive; a failure surfaces there, not as
+		// an unhandled rejection while an earlier month is still being read.
+		done.catch(() => {});
+		each.set(dest, done);
 	}
-	return paths;
+	return each;
 }

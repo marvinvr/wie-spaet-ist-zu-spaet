@@ -1,0 +1,10 @@
+processes:
+  - name: Data build
+    cmd: node
+    args: ["pipeline/build.js", "--months", "6"]
+    autostart: false
+  - name: Dev server
+    # vite directly: npm refuses to run under Node != devEngines (24.14.1)
+    cmd: node_modules/.bin/vite
+    args: ["dev"]
+    autostart: false

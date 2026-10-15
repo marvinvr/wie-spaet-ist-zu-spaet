@@ -26,7 +26,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import readline from 'node:readline';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import zlib from 'node:zlib';
 
 import { isHoliday } from '../src/lib/transit/holidays.ts';
@@ -36,12 +36,15 @@ import {
 	REPO,
 	WORK_DIR,
 	addDays,
+	defaultJobs,
 	die,
 	ensureDir,
 	isoDate,
 	log,
 	mb,
 	num,
+	pool,
+	slots,
 	timed,
 	weekdayIndex
 } from './layout.js';
@@ -88,6 +91,54 @@ const MIN_HEAP_MB = 1536;
 export function heapLimitMb() {
 	const affordable = Math.floor((os.totalmem() * HEAP_SHARE) / 1e6);
 	return Math.max(MIN_HEAP_MB, Math.min(NODE_HEAP_MB, affordable));
+}
+
+/**
+ * How many weekdays RAM allows to parse at once.
+ *
+ * Each parse may grow to its full heap cap before V8 collects in earnest, so
+ * the caps together have to fit the same share of RAM one cap is sized from.
+ * Cores are the `cpu` slots' business (see build()).
+ */
+export function parseJobs(heapMb) {
+	const byMemory = Math.floor((os.totalmem() * HEAP_SHARE) / 1e6 / heapMb);
+	return Math.max(1, Math.min(DAY_TYPES.length, byMemory));
+}
+
+// Children still running, so neither a die() in one weekday nor a stopped build
+// leaves the others parsing on - and writing into the same files as the next run.
+const children = new Set();
+process.on('exit', () => {
+	for (const child of children) child.kill('SIGKILL');
+});
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+	process.once(signal, () => process.exit(128 + os.constants.signals[signal]));
+}
+
+/**
+ * spawnSync's result shape ({ status, signal, error, stdout }), without blocking
+ * the other weekdays while this one runs - and only once one of the `cpu` slots
+ * is free, which it holds until the child is gone.
+ */
+function runOn(cpu, command, args, stdio) {
+	return cpu.run(() => run(command, args, stdio));
+}
+
+function run(command, args, stdio) {
+	return new Promise((resolve) => {
+		const child = spawn(command, args, { stdio });
+		children.add(child);
+		let stdout = '';
+		child.stdout?.setEncoding('utf8').on('data', (chunk) => (stdout += chunk));
+		child.on('error', (error) => {
+			children.delete(child);
+			resolve({ status: null, signal: null, error, stdout });
+		});
+		child.on('close', (status, signal) => {
+			children.delete(child);
+			resolve({ status, signal, error: null, stdout });
+		});
+	});
 }
 
 /**
@@ -330,13 +381,23 @@ function gzipTo(source, dest) {
 /**
  * Writes stops.bin.gz and timetable.<weekday>.bin.gz.
  *
+ * Every weekday parses at once, as far as RAM allows - and each child holds one
+ * of the `cpu` slots while it runs, which it shares with whatever else the build
+ * is doing at the same time.
+ *
  * @returns {Promise<Record<string, string>>} the date used per day type
  */
 export async function build(
 	gtfsZip,
 	dates,
-	{ force = false, node = process.execPath, heapMb = heapLimitMb() } = {}
+	{
+		force = false,
+		node = process.execPath,
+		heapMb = heapLimitMb(),
+		cpu = slots(defaultJobs())
+	} = {}
 ) {
+	const jobs = Math.min(parseJobs(heapMb), cpu.count);
 	if (!fs.existsSync(MINOTOR_CLI)) {
 		die(`minotor CLI not found at ${MINOTOR_CLI} - run \`npm install\` first.`);
 	}
@@ -352,7 +413,10 @@ export async function build(
 		}
 	}
 
-	log(`  ${heapMb} MB heap per parse, ${(os.totalmem() / 1e9).toFixed(1)} GB on this machine`);
+	log(
+		`  ${heapMb} MB heap per parse, ${jobs} at a time, ` +
+			`${(os.totalmem() / 1e9).toFixed(1)} GB on this machine`
+	);
 	// Twice the peak is what makes a run comfortable; below that the parse and
 	// the system are competing, and no heap size fixes it. Worth saying before
 	// the eight minutes rather than after, because without swap the only symptom
@@ -378,10 +442,9 @@ export async function build(
 
 	const feed = await namedFeed(gtfsZip, { force });
 
-	let stopsSource = null;
 	const used = {};
 
-	for (const dayType of DAY_TYPES) {
+	await pool(DAY_TYPES, jobs, async (dayType) => {
 		const date = dates.get(dayType);
 		used[dayType] = isoDate(date);
 
@@ -414,7 +477,8 @@ export async function build(
 				const warnFd = fs.openSync(warnFile, 'w');
 				let result;
 				try {
-					result = spawnSync(
+					result = await runOn(
+						cpu,
 						node,
 						[
 							`--max-old-space-size=${heapMb}`,
@@ -430,7 +494,7 @@ export async function build(
 							stopsBin,
 							feed
 						],
-						{ stdio: ['ignore', logFd, warnFd] }
+						['ignore', logFd, warnFd]
 					);
 				} finally {
 					fs.closeSync(logFd);
@@ -471,22 +535,30 @@ export async function build(
 			fs.readFileSync(tailStampFile, 'utf8').trim() === want;
 		if (!tailFresh) {
 			fs.rmSync(tailBin, { force: true });
-			const result = spawnSync(
+			// Its one line of output is collected rather than inherited, so it can
+			// say which weekday it is about among the others running beside it.
+			const result = await runOn(
+				cpu,
 				node,
 				[`--max-old-space-size=${heapMb}`, TAIL_SCRIPT, timetableBin, tailBin],
-				{ stdio: ['ignore', 'inherit', 'inherit'] }
+				['ignore', 'pipe', 'inherit']
 			);
 			if (result.status !== 0 || !fs.existsSync(tailBin)) {
 				die(`cutting the tail of timetable.${dayType}: ${whyItStopped(result, heapMb)}.`);
+			}
+			for (const line of result.stdout.trimEnd().split('\n')) {
+				if (line.trim()) log(`    ${dayType}: ${line.trim()}`);
 			}
 			fs.writeFileSync(tailStampFile, want);
 		}
 		const tailSize = gzipTo(tailBin, path.join(OUT_DIR, `tail.${dayType}.bin.gz`));
 		log(`    tail.${dayType}.bin.gz  ${mb(fs.statSync(tailBin).size)} -> ${mb(tailSize)}`);
 
-		if (stopsSource === null) stopsSource = stopsBin;
-	}
+	});
 
+	// The stops index doesn't depend on the date (see the top of this file), so
+	// the first weekday's stands for all of them.
+	const stopsSource = path.join(WORK_DIR, `stops.${DAY_TYPES[0]}.bin`);
 	const size = gzipTo(stopsSource, path.join(OUT_DIR, 'stops.bin.gz'));
 	log(`    stops.bin.gz  ${mb(fs.statSync(stopsSource).size)} -> ${mb(size)}`);
 	return used;

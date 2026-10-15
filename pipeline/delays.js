@@ -465,26 +465,51 @@ function readSamples(file) {
 	return { rows, names, bpuic, delay, line, dep, off };
 }
 
+/** One day of an archive reduced to its sample file; runs on a worker. */
+async function extractDay({ archive, entry, file }) {
+	const parser = new SampleParser();
+	await pipeline(
+		openMember(archive, entry),
+		new Writable({
+			highWaterMark: 1 << 22,
+			write(chunk, _encoding, done) {
+				parser.push(chunk);
+				done();
+			}
+		})
+	);
+	parser.end();
+	fs.writeFileSync(file, zlib.zstdCompressSync(parser.serialize()));
+	return { result: { rows: parser.rows, lines: parser.lineTable } };
+}
+
 /**
  * Reduces each day in each archive to a sample file.
  *
- * `fetch` is called with an archive that isn't on disk yet and returns whether it
- * could be downloaded; `prune` deletes each archive once its days are read.
- * Together they keep peak disk at one month rather than all twelve.
+ * `fetch` is called with each archive before it is read and resolves to whether
+ * it is there - downloading it first, or waiting for a download already under
+ * way, so a month is read as soon as its archive is complete. Without `fetch`
+ * an archive counts when it is on disk. `prune` deletes each archive once its
+ * days are read, and holds the next month back until then: that keeps peak disk
+ * at one month rather than all twelve.
+ *
+ * The days themselves run on `workers`, as many at once as it has slots for.
  *
  * @returns {Promise<{ days: Record<string, string[]>, lines: Set<string> }>}
  *   the service days covered per day type, and every line text seen
  */
 export async function extract(
 	archives,
-	{ dayLimit = null, force = false, fetch = null, prune = false } = {}
+	{ dayLimit = null, force = false, fetch = null, prune = false, workers }
 ) {
 	const days = Object.fromEntries(DAY_TYPES.map((dayType) => [dayType, []]));
 	const lines = new Set();
 	let processed = 0;
+	const months = [];
 
 	for (const archive of archives) {
-		if (!fs.existsSync(archive) && !(fetch !== null && (await fetch(archive)))) {
+		const available = fetch !== null ? await fetch(archive) : fs.existsSync(archive);
+		if (!available) {
 			// Not published or not downloaded. The month is part of the window all
 			// the same, so what an earlier run extracted from it still counts.
 			const cached = cachedDaysOf(archive);
@@ -507,10 +532,13 @@ export async function extract(
 		}
 		log(`  ${path.basename(archive)}: ${members.length} service days`);
 
+		const month = [];
+		let stopped = false;
 		for (const { date, entry } of members) {
 			if (dayLimit !== null && processed >= dayLimit) {
 				log(`  stopping after ${processed} days (--days)`);
-				return { days, lines };
+				stopped = true;
+				break;
 			}
 			const dayType = dayTypeOf(date);
 			const file = sampleFile(dayType, isoDate(date));
@@ -531,33 +559,29 @@ export async function extract(
 				continue;
 			}
 
-			const parser = new SampleParser();
-			await pipeline(
-				openMember(archive, entry),
-				new Writable({
-					highWaterMark: 1 << 22,
-					write(chunk, _encoding, done) {
-						parser.push(chunk);
-						done();
-					}
-				})
-			);
-			parser.end();
-
-			fs.writeFileSync(file, zlib.zstdCompressSync(parser.serialize()));
-			for (const name of parser.lineTable) lines.add(name);
-			days[dayType].push(isoDate(date));
 			processed++;
-
-			const holiday = holidayName(date);
-			log(
-				`    ${isoDate(date)} ${dayType.padEnd(9)} ${num(parser.rows).padStart(10)} departures` +
-					` -> ${mb(fs.statSync(file).size)}` +
-					(holiday ? `   (${holiday}, counted as Sunday)` : '')
+			month.push(
+				workers.run({ kind: 'extractDay', archive, entry, file }).then(({ rows, lines: names }) => {
+					for (const name of names) lines.add(name);
+					days[dayType].push(isoDate(date));
+					const holiday = holidayName(date);
+					log(
+						`    ${isoDate(date)} ${dayType.padEnd(9)} ${num(rows).padStart(10)} departures` +
+							` -> ${mb(fs.statSync(file).size)}` +
+							(holiday ? `   (${holiday}, counted as Sunday)` : '')
+					);
+				})
 			);
 		}
 
+		const read = Promise.all(month);
+		// Awaited below; until then a failed day must not count as unhandled.
+		read.catch(() => {});
+		months.push(read);
+		if (stopped) break;
+
 		if (prune) {
+			await read;
 			// The `.fetched` stamp goes with it, or the next download would believe
 			// the (now absent) archive is still up to date.
 			const size = fs.statSync(archive).size;
@@ -565,7 +589,9 @@ export async function extract(
 			fs.rmSync(`${archive}.fetched`, { force: true });
 			log(`  ${path.basename(archive)}: removed, ${mb(size)} freed (--prune)`);
 		}
+		// Otherwise on to the next month while this one's days are still running.
 	}
+	await Promise.all(months);
 	return { days, lines };
 }
 
@@ -700,8 +726,12 @@ const roundHalfUp = (value) => (value < 0 ? -Math.round(-value) : Math.round(val
  * matter how many months are in the samples: the exact percentile has to hold
  * every observation of a group at once, and a year of one weekday is ~117 M rows.
  * Re-reading the samples per pass costs about a second - far less than spilling.
+ *
+ * The passes share nothing: a service's day offsets collapse within its own
+ * bpuic, which is in exactly one of them. So `only` runs just that pass, and
+ * shard() hands each to a worker of its own.
  */
-function aggregateDayType(files, lineIndex, allowed, maxBpuic, minSamples, chunks) {
+function aggregateDayType(files, lineIndex, allowed, maxBpuic, minSamples, chunks, only = null) {
 	const out = {
 		count: 0,
 		capacity: 1 << 22,
@@ -743,7 +773,7 @@ function aggregateDayType(files, lineIndex, allowed, maxBpuic, minSamples, chunk
 	// service collapse into the best-sampled one.
 	const bestRow = new KeyMap(22);
 
-	for (let chunk = 0; chunk < chunks; chunk++) {
+	for (let chunk = only ?? 0; chunk < (only === null ? chunks : only + 1); chunk++) {
 		const groups = new KeyMap(22);
 		let groupCount = 0;
 		let groupCapacity = 1 << 22;
@@ -947,6 +977,73 @@ function writeShards(out, dest) {
 	return { files, bytes, clamped, stations: stationIds };
 }
 
+// The per-service columns of aggregateDayType()'s result, which travel between
+// threads trimmed to their row count.
+const OUT_COLUMNS = {
+	bpuic: Int32Array,
+	line: Uint16Array,
+	dep: Uint16Array,
+	p10: Int32Array,
+	avg: Int32Array,
+	samples: Int32Array,
+	off: Int8Array
+};
+
+const transferOf = (out) => Object.keys(OUT_COLUMNS).map((name) => out[name].buffer);
+
+/** The passes' results end to end, in pass order - as one run of all of them would give. */
+function concatOut(parts) {
+	const out = { count: 0, ignoredRows: 0, ignoredLines: new Set() };
+	for (const part of parts) {
+		out.count += part.count;
+		out.ignoredRows += part.ignoredRows;
+		for (const name of part.ignoredLines) out.ignoredLines.add(name);
+	}
+	for (const [name, Type] of Object.entries(OUT_COLUMNS)) {
+		out[name] = new Type(out.count);
+		let at = 0;
+		for (const part of parts) {
+			out[name].set(part[name], at);
+			at += part.count;
+		}
+	}
+	return out;
+}
+
+/** What a worker thread runs for each message it gets; see workers.js. */
+export async function runTask(task) {
+	switch (task.kind) {
+		case 'extractDay':
+			return extractDay(task);
+		case 'aggregate': {
+			const lineIndex = new Map(task.lineTable.map((line, index) => [line, index]));
+			const full = aggregateDayType(
+				task.files,
+				lineIndex,
+				task.allowed,
+				task.maxBpuic,
+				task.minSamples,
+				task.chunks,
+				task.chunk
+			);
+			const out = {
+				count: full.count,
+				ignoredRows: full.ignoredRows,
+				ignoredLines: [...full.ignoredLines]
+			};
+			for (const name of Object.keys(OUT_COLUMNS)) out[name] = full[name].slice(0, full.count);
+			return { result: out, transfer: transferOf(out) };
+		}
+		case 'writeShards': {
+			const result = writeShards(task.out, task.dest);
+			const stations = Int32Array.from(result.stations);
+			return { result: { ...result, stations }, transfer: [stations.buffer] };
+		}
+		default:
+			throw new Error(`unknown task ${task.kind}`);
+	}
+}
+
 /**
  * Aggregates the samples per day type and per DELAY_GROUPS pool, and writes the
  * gzipped delay shards.
@@ -958,10 +1055,8 @@ function writeShards(out, dest) {
  */
 export async function shard(
 	outDir,
-	{ lineTable, allowed, days, minSamples = 1, chunks = 4 }
+	{ lineTable, allowed, days, minSamples = 1, chunks = 4, workers }
 ) {
-	const lineIndex = new Map(lineTable.map((line, index) => [line, index]));
-
 	// The aggregation packs (bpuic, line, minute, offset) into one float64 key,
 	// which is exact only while each field stays inside its bit width. Both bounds
 	// hold by a wide margin today (~1.2 k lines, 7-digit BPUICs), but a silently
@@ -976,7 +1071,8 @@ export async function shard(
 	if (maxBpuic >= BPUIC_LIMIT) {
 		throw new Error(`BPUIC ${maxBpuic} exceeds the ${BPUIC_LIMIT} the key packing allows`);
 	}
-	const allowedBits = new Uint8Array(maxBpuic + 1);
+	// Shared, so the workers all read the one copy instead of each getting their own.
+	const allowedBits = new Uint8Array(new SharedArrayBuffer(maxBpuic + 1));
 	for (const bpuic of allowed) allowedBits[bpuic] = 1;
 
 	// Written next to the live shards and swapped in once every day type is done:
@@ -1018,8 +1114,25 @@ export async function shard(
 		const passes = chunks * withSamples.length;
 
 		const written = await timed(`${name} aggregation`, async () => {
-			const out = aggregateDayType(files, lineIndex, allowedBits, maxBpuic, minSamples, passes);
-			const result = writeShards(out, path.join(buildDir, name));
+			const parts = await Promise.all(
+				Array.from({ length: passes }, (_, chunk) =>
+					workers.run({
+						kind: 'aggregate',
+						files,
+						lineTable,
+						allowed: allowedBits,
+						maxBpuic,
+						minSamples,
+						chunks: passes,
+						chunk
+					})
+				)
+			);
+			const out = concatOut(parts);
+			const result = await workers.run(
+				{ kind: 'writeShards', out, dest: path.join(buildDir, name) },
+				transferOf(out)
+			);
 			for (const bpuic of result.stations) stations.add(bpuic);
 			return {
 				rows: out.count,
@@ -1044,12 +1157,20 @@ export async function shard(
 		return true;
 	};
 
-	for (const dayType of DAY_TYPES) {
-		if (await aggregate(dayType, [dayType])) covered.push(dayType);
-	}
-	for (const [group, dayTypes] of Object.entries(DELAY_GROUPS)) {
-		if (await aggregate(group, dayTypes)) coveredGroups.push(group);
-	}
+	// All at once, the largest pools first: their passes read the most days, and
+	// queued last they would leave a few long passes running on an idle machine.
+	const jobs = [
+		...Object.entries(DELAY_GROUPS),
+		...DAY_TYPES.map((dayType) => [dayType, [dayType]])
+	].toSorted((a, b) => b[1].length - a[1].length);
+	const done = new Set();
+	await Promise.all(
+		jobs.map(async ([name, dayTypes]) => {
+			if (await aggregate(name, dayTypes)) done.add(name);
+		})
+	);
+	covered.push(...DAY_TYPES.filter((dayType) => done.has(dayType)));
+	coveredGroups.push(...Object.keys(DELAY_GROUPS).filter((group) => done.has(group)));
 
 	const oldDir = `${delaysDir}.old`;
 	fs.rmSync(oldDir, { recursive: true, force: true });

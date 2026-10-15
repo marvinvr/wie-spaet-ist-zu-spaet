@@ -26,6 +26,7 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { parseArgs } from 'node:util';
@@ -33,6 +34,7 @@ import { parseArgs } from 'node:util';
 import * as delaysStep from './delays.js';
 import * as downloadStep from './download.js';
 import * as timetablesStep from './timetables.js';
+import { WorkerPool } from './workers.js';
 import {
 	AGG_CHUNKS,
 	BUCKETS,
@@ -42,6 +44,7 @@ import {
 	GTFS_ZIP,
 	OUT_DIR,
 	WORK_DIR,
+	defaultJobs,
 	die,
 	duration,
 	ensureDir,
@@ -51,6 +54,7 @@ import {
 	mb,
 	num,
 	parseIsoDate,
+	slots,
 	step,
 	today as todayDate
 } from './layout.js';
@@ -75,6 +79,8 @@ const USAGE = `Build the static data bundle in static/data/.
   --node PATH       node executable for the minotor CLI (default: this one)
   --heap MB         heap cap for the GTFS parse; the default is sized to the
                     machine, raise it only where there is RAM to back it
+  --jobs N          parses and worker tasks running at once, across all steps
+                    (default: all cores but two, as far as RAM allows)
   --today DATE      pretend today is this date (YYYY-MM-DD), for reproducible runs
 `;
 
@@ -93,6 +99,7 @@ function parseCli() {
 				prune: { type: 'boolean', default: false },
 				node: { type: 'string', default: process.execPath },
 				heap: { type: 'string' },
+				jobs: { type: 'string' },
 				today: { type: 'string' },
 				help: { type: 'boolean', default: false }
 			},
@@ -136,6 +143,7 @@ function parseCli() {
 		prune: values.prune,
 		node: values.node,
 		heap: integer('heap', values.heap, { min: 512 }),
+		jobs: integer('jobs', values.jobs),
 		today: values.today ? parseIsoDate(values.today) : todayDate()
 	};
 }
@@ -167,18 +175,34 @@ async function main() {
 	log(`wie-spaet-ist-zu-spaet data build   (today ${isoDate(args.today)})`);
 	log(`  Ist-Daten months: ${label(months[0])} .. ${label(months.at(-1))}`);
 
+	// Every parse and every worker task takes one of these slots, so the steps
+	// running side by side below share the machine instead of each claiming it.
+	const cpu = slots(args.jobs ?? defaultJobs());
+	const workers = new WorkerPool(cpu);
+	log(`  ${cpu.count} jobs at a time on ${os.availableParallelism()} cores`);
+
 	// ------------------------------------------------------------- download
+	// archive -> whether it is on disk, once its download is through.
+	let downloads = null;
 	if (wanted(args, 'download')) {
 		step('Downloading upstream feeds');
+		// The Ist-Daten are 15 GB and only the delays step reads them: they keep
+		// downloading while the timetables parse, and each month is read as soon
+		// as its archive is in. With --prune extract() fetches them one at a time.
+		if (wanted(args, 'delays') && !args.prune) downloads = downloadStep.istdatenEach(months);
 		await downloadStep.gtfs();
-		// The Ist-Daten are 15 GB and only the delays step reads them - with
-		// --prune it fetches them one archive at a time instead.
-		if (wanted(args, 'delays') && !args.prune) await downloadStep.istdaten(months);
 	}
 	if (!fs.existsSync(GTFS_ZIP)) die(`${GTFS_ZIP} is missing - run the download step first.`);
 
+	// The timetables need only the GTFS feed and the delays only the Ist-Daten,
+	// so the two steps run side by side.
+	await Promise.all([
+		wanted(args, 'timetables') ? buildTimetables() : null,
+		wanted(args, 'delays') ? buildDelays() : null
+	]).finally(() => workers.close());
+
 	// ----------------------------------------------------------- timetables
-	if (wanted(args, 'timetables')) {
+	async function buildTimetables() {
 		step('Building timetables (minotor)');
 		const window = await timetablesStep.feedWindow(GTFS_ZIP);
 		const dates = timetablesStep.timetableDates(args.today, window);
@@ -192,28 +216,33 @@ async function main() {
 			force: args.force,
 			node: args.node,
 			// undefined, not null: that is what lets build() fall back to its own default.
-			heapMb: args.heap ?? undefined
+			heapMb: args.heap ?? undefined,
+			cpu
 		});
 	}
 
 	// --------------------------------------------------------------- delays
-	if (wanted(args, 'delays')) {
+	async function buildDelays() {
 		step('Reading Ist-Daten');
 		// Every month of the window, on disk or not: for one whose archive can't be
 		// read, extract() uses the samples an earlier run left behind.
 		const byPath = new Map(months.map((month) => [downloadStep.istdatenPath(...month), month]));
 		const archives = [...byPath.keys()];
 		// With --prune nothing is on disk yet, and the extract loop pulls each
-		// archive down as it gets there.
-		const fetch = args.prune
-			? async (archive) => (await downloadStep.istdaten([byPath.get(archive)])).length > 0
-			: null;
+		// archive down as it gets there; otherwise it waits for the download above.
+		let fetch = null;
+		if (args.prune) {
+			fetch = async (archive) => (await downloadStep.istdaten([byPath.get(archive)])).length > 0;
+		} else if (downloads !== null) {
+			fetch = (archive) => downloads.get(archive);
+		}
 
 		const { days, lines } = await delaysStep.extract(archives, {
 			dayLimit: args.days,
 			force: args.force,
 			fetch,
-			prune: args.prune
+			prune: args.prune,
+			workers
 		});
 		const covered = Object.values(days).reduce((total, dates) => total + dates.length, 0);
 		if (covered === 0) die('no Ist-Daten service days were processed.');
@@ -228,7 +257,8 @@ async function main() {
 			allowed,
 			days,
 			minSamples: args.minSamples,
-			chunks: args.chunks
+			chunks: args.chunks,
+			workers
 		});
 
 		const dayCount = (dayTypes) =>

@@ -8,6 +8,7 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -92,6 +93,59 @@ export async function timed(label, body) {
 	const result = await body();
 	log(`  ${label} took ${duration((performance.now() - started) / 1000)}`);
 	return result;
+}
+
+/**
+ * The default for how many jobs - parses and worker tasks together - run at
+ * once: all cores but two, so the machine stays usable, and no more than the
+ * RAM backs at ~1 GB per job (an aggregation pass over a year peaks at ~600 MB).
+ */
+export function defaultJobs() {
+	const byMemory = Math.floor((os.totalmem() * 0.6) / 1e9);
+	return Math.max(1, Math.min(os.availableParallelism() - 2, byMemory));
+}
+
+/**
+ * A counting semaphore: `run(fn)` waits for one of `count` slots, then holds it
+ * while `fn` runs. Shared by every step that runs at the same time, so together
+ * they never take more than `count` cores.
+ */
+export function slots(count) {
+	let free = count;
+	const waiting = [];
+	return {
+		count,
+		async run(fn) {
+			if (free > 0) free--;
+			else await new Promise((resolve) => waiting.push(resolve));
+			try {
+				return await fn();
+			} finally {
+				// Hand the slot straight to the next waiter, or give it back.
+				const next = waiting.shift();
+				if (next) next();
+				else free++;
+			}
+		}
+	};
+}
+
+/**
+ * Runs `fn` over `items` with at most `limit` calls in flight.
+ *
+ * @returns {Promise<any[]>} the results, in the order of `items`
+ */
+export async function pool(items, limit, fn) {
+	const results = new Array(items.length);
+	let next = 0;
+	const worker = async () => {
+		while (next < items.length) {
+			const index = next++;
+			results[index] = await fn(items[index], index);
+		}
+	};
+	await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
+	return results;
 }
 
 export function die(message) {
